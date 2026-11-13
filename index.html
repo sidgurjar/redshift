@@ -1,0 +1,946 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
+<title>REDSHIFT</title>
+<style>
+  /* Committed single-theme design: a dark cabin at night. The page paints
+     its own ground; nothing inherits from the host. */
+  :root {
+    --bg: #0a0004;
+    --red: #ff2d1e;
+    --red-dim: #8a1510;
+    --red-deep: #47080a;
+    --white: #fff3ee;
+    --blue: #5ad1ff;
+  }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  html, body {
+    height: 100%;
+    background: var(--bg);
+    overflow: hidden;
+    touch-action: none;
+    overscroll-behavior: none;
+    user-select: none;
+    -webkit-user-select: none;
+    font-family: -apple-system, BlinkMacSystemFont, "Helvetica Neue", "Segoe UI", sans-serif;
+  }
+  canvas { display: block; width: 100vw; height: 100vh; }
+  .btn {
+    position: fixed;
+    bottom: calc(14px + env(safe-area-inset-bottom));
+    width: 46px; height: 46px;
+    border-radius: 50%;
+    border: 1px solid rgba(255, 45, 30, 0.35);
+    color: rgba(255, 115, 100, 0.8);
+    background: rgba(10, 0, 4, 0.55);
+    font-size: 19px; line-height: 44px; text-align: center;
+    cursor: pointer;
+    z-index: 3;
+    transition: color .15s, border-color .15s, box-shadow .15s;
+  }
+  .btn:focus-visible { outline: 2px solid var(--blue); outline-offset: 2px; }
+  .btn.on {
+    color: var(--blue);
+    border-color: rgba(90, 209, 255, 0.55);
+    box-shadow: 0 0 14px rgba(90, 209, 255, 0.25);
+  }
+  .btn.on-red {
+    color: #ff6a58;
+    border-color: rgba(255, 45, 30, 0.7);
+    box-shadow: 0 0 14px rgba(255, 45, 30, 0.3);
+  }
+  #combBtn { left: calc(14px + env(safe-area-inset-left)); }
+  #muteBtn { right: calc(14px + env(safe-area-inset-right)); }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<button class="btn" id="combBtn" aria-label="Toggle curvature comb" title="Curvature comb (C)">&kappa;</button>
+<button class="btn" id="muteBtn" aria-label="Toggle audio" title="Audio (M)">&#9835;</button>
+
+<script>
+"use strict";
+/* ============================================================== *
+ *  REDSHIFT - a zen spline flier.
+ *  Hold to curve up, release to curve down. Your path is the
+ *  spline; fly it tightly and you blueshift.
+ * ============================================================== */
+
+/* ---------- tiny utils ---------- */
+const clamp  = (v, a, b) => v < a ? a : v > b ? b : v;
+const lerp   = (a, b, t) => a + (b - a) * t;
+const rand   = (a, b) => a + Math.random() * (b - a);
+// exponential smoothing that is stable across frame rates
+const damp   = (a, b, rate, dt) => lerp(a, b, 1 - Math.exp(-rate * dt));
+const TAU    = Math.PI * 2;
+const wrapAngle = a => { while (a >  Math.PI) a -= TAU; while (a < -Math.PI) a += TAU; return a; };
+
+const store = {
+  get(k) { try { return localStorage.getItem(k); } catch (e) { return null; } },
+  set(k, v) { try { localStorage.setItem(k, v); } catch (e) {} },
+};
+
+const reducedMotion = matchMedia("(prefers-reduced-motion: reduce)").matches;
+
+/* ---------- palette ---------- */
+const COL = {
+  bg:      "#0a0004",
+  red:     "#ff2d1e",
+  redHot:  "#ff8a72",
+  redDim:  "rgba(255,45,30,0.5)",
+  redDeep: "rgba(138,21,16,0.8)",
+  white:   "#fff3ee",
+  blue:    "#5ad1ff",
+  blueDim: "rgba(90,209,255,0.45)",
+};
+
+/* ---------- canvas ---------- */
+const cv = document.getElementById("c");
+const cx = cv.getContext("2d");
+let W = 0, H = 0, DPR = 1;
+
+function resize() {
+  DPR = Math.min(window.devicePixelRatio || 1, 2);
+  const w = window.innerWidth, h = window.innerHeight;
+  cv.width = Math.round(w * DPR);
+  cv.height = Math.round(h * DPR);
+  cv.style.width = w + "px";
+  cv.style.height = h + "px";
+  cx.setTransform(DPR, 0, 0, DPR, 0, 0);
+  if (H > 0) player.y = clamp(player.y * (h / H), 40, h - 40);
+  W = w; H = h;
+  buildStars();
+}
+
+/* ============================================================== *
+ *  AUDIO - procedural synthwave. No files; everything is synth.
+ *  A 4-bar loop in A minor: Am - F - C - G. Kick on the floor,
+ *  sidechained pads, a 16th-note bass, an arpeggio through a
+ *  feedback delay for the sparkle.
+ * ============================================================== */
+const Audio = {
+  ac: null, started: false, muted: store.get("rs_muted") === "1",
+  bus: null, duck: null, delay: null,
+  bpm: 104, step: 0, nextTime: 0, timer: null,
+  beatQueue: [],          // kick timestamps the renderer pulses on
+
+  // midi helpers
+  f(m) { return 440 * Math.pow(2, (m - 69) / 12); },
+
+  // chord progression: one chord per bar (16 steps per bar)
+  chords: [
+    { pad: [57, 60, 64], bass: 33, arp: [69, 72, 76, 81] }, // Am
+    { pad: [53, 57, 60], bass: 29, arp: [65, 69, 72, 77] }, // F
+    { pad: [55, 60, 64], bass: 36, arp: [72, 76, 79, 84] }, // C
+    { pad: [55, 59, 62], bass: 31, arp: [67, 71, 74, 79] }, // G
+  ],
+
+  start() {
+    if (this.started) { if (this.ac.state === "suspended") this.ac.resume(); return; }
+    const AC = window.AudioContext || window.webkitAudioContext;
+    if (!AC) return;
+    this.ac = new AC();
+    const ac = this.ac;
+
+    const comp = ac.createDynamicsCompressor();
+    comp.threshold.value = -16; comp.ratio.value = 6;
+    comp.connect(ac.destination);
+
+    this.master = ac.createGain();
+    this.master.gain.value = this.muted ? 0 : 0.6;
+    this.master.connect(comp);
+
+    // everything musical passes through the duck (sidechain)
+    this.duck = ac.createGain();
+    this.duck.connect(this.master);
+
+    // drums bypass the duck
+    this.drums = ac.createGain();
+    this.drums.gain.value = 0.9;
+    this.drums.connect(this.master);
+
+    // feedback delay for the arp
+    this.delay = ac.createDelay(1);
+    this.delay.delayTime.value = (60 / this.bpm) * 0.75; // dotted 8th
+    const fb = ac.createGain(); fb.gain.value = 0.38;
+    const dWet = ac.createGain(); dWet.gain.value = 0.5;
+    this.delay.connect(fb); fb.connect(this.delay);
+    this.delay.connect(dWet); dWet.connect(this.duck);
+
+    this.noiseBuf = this.makeNoise();
+    this.started = true;
+    this.step = 0;
+    this.nextTime = ac.currentTime + 0.1;
+    this.timer = setInterval(() => this.schedule(), 30);
+  },
+
+  makeNoise() {
+    const len = this.ac.sampleRate * 0.4;
+    const buf = this.ac.createBuffer(1, len, this.ac.sampleRate);
+    const d = buf.getChannelData(0);
+    for (let i = 0; i < len; i++) d[i] = Math.random() * 2 - 1;
+    return buf;
+  },
+
+  schedule() {
+    const ac = this.ac, spb = 60 / this.bpm / 4; // seconds per 16th
+    while (this.nextTime < ac.currentTime + 0.12) {
+      this.playStep(this.step, this.nextTime);
+      this.step = (this.step + 1) % 64; // 4 bars of 16
+      this.nextTime += spb;
+    }
+  },
+
+  env(g, t, a, peak, d) {  // quick attack/decay envelope on a gain param
+    g.setValueAtTime(0.0001, t);
+    g.linearRampToValueAtTime(peak, t + a);
+    g.exponentialRampToValueAtTime(0.0001, t + a + d);
+  },
+
+  osc(type, freq, t, dur, peak, dest, detune) {
+    const o = this.ac.createOscillator(), g = this.ac.createGain();
+    o.type = type; o.frequency.value = freq;
+    if (detune) o.detune.value = detune;
+    this.env(g.gain, t, 0.004, peak, dur);
+    o.connect(g); g.connect(dest);
+    o.start(t); o.stop(t + dur + 0.1);
+    return o;
+  },
+
+  playStep(step, t) {
+    const bar = (step / 16) | 0, s = step % 16;
+    const ch = this.chords[bar];
+    const spb = 60 / this.bpm / 4;
+
+    // kick: 0 4 8 12  (+ sidechain duck + visual beat)
+    if (s % 4 === 0) {
+      const o = this.ac.createOscillator(), g = this.ac.createGain();
+      o.type = "sine";
+      o.frequency.setValueAtTime(150, t);
+      o.frequency.exponentialRampToValueAtTime(40, t + 0.1);
+      this.env(g.gain, t, 0.002, 1.0, 0.16);
+      o.connect(g); g.connect(this.drums);
+      o.start(t); o.stop(t + 0.3);
+      const d = this.duck.gain;
+      d.cancelScheduledValues(t);
+      d.setValueAtTime(0.32, t);
+      d.linearRampToValueAtTime(1.0, t + 0.22);
+      this.beatQueue.push(t);
+    }
+
+    // snare: 4 12
+    if (s === 4 || s === 12) {
+      const n = this.ac.createBufferSource(); n.buffer = this.noiseBuf;
+      const bp = this.ac.createBiquadFilter();
+      bp.type = "bandpass"; bp.frequency.value = 2000; bp.Q.value = 0.8;
+      const g = this.ac.createGain();
+      this.env(g.gain, t, 0.002, 0.5, 0.16);
+      n.connect(bp); bp.connect(g); g.connect(this.drums);
+      n.start(t); n.stop(t + 0.25);
+    }
+
+    // hats: offbeat 8ths, quiet
+    if (s % 4 === 2) {
+      const n = this.ac.createBufferSource(); n.buffer = this.noiseBuf;
+      const hp = this.ac.createBiquadFilter();
+      hp.type = "highpass"; hp.frequency.value = 7500;
+      const g = this.ac.createGain();
+      this.env(g.gain, t, 0.001, 0.12, 0.04);
+      n.connect(hp); hp.connect(g); g.connect(this.drums);
+      n.start(t); n.stop(t + 0.08);
+    }
+
+    // bass: driving 16ths, octave pop on the "and"s
+    {
+      const midi = ch.bass + (s % 4 === 2 ? 12 : 0);
+      const o = this.ac.createOscillator(), g = this.ac.createGain();
+      const lp = this.ac.createBiquadFilter();
+      lp.type = "lowpass"; lp.frequency.value = 480; lp.Q.value = 6;
+      o.type = "sawtooth"; o.frequency.value = this.f(midi);
+      this.env(g.gain, t, 0.004, 0.34, spb * 0.9);
+      o.connect(lp); lp.connect(g); g.connect(this.duck);
+      o.start(t); o.stop(t + spb + 0.05);
+    }
+
+    // pad: one chord per bar, slow bloom, two detuned saws per voice
+    if (s === 0) {
+      const barDur = spb * 16;
+      for (const m of ch.pad) {
+        for (const dt of [-7, 7]) {
+          const o = this.ac.createOscillator(), g = this.ac.createGain();
+          const lp = this.ac.createBiquadFilter();
+          lp.type = "lowpass"; lp.frequency.value = 900;
+          o.type = "sawtooth"; o.frequency.value = this.f(m); o.detune.value = dt;
+          g.gain.setValueAtTime(0.0001, t);
+          g.gain.linearRampToValueAtTime(0.055, t + 0.5);
+          g.gain.setValueAtTime(0.055, t + barDur - 0.3);
+          g.gain.linearRampToValueAtTime(0.0001, t + barDur);
+          o.connect(lp); lp.connect(g); g.connect(this.duck);
+          o.start(t); o.stop(t + barDur + 0.1);
+        }
+      }
+    }
+
+    // arp: 8ths, up then down, into the delay
+    if (s % 2 === 0) {
+      const seq = [0, 1, 2, 3, 2, 1, 0, 1];
+      const m = ch.arp[seq[(s / 2) | 0] % 4];
+      const o = this.ac.createOscillator(), g = this.ac.createGain();
+      o.type = "square"; o.frequency.value = this.f(m);
+      this.env(g.gain, t, 0.004, 0.05, 0.14);
+      o.connect(g); g.connect(this.duck); g.connect(this.delay);
+      o.start(t); o.stop(t + 0.25);
+    }
+  },
+
+  // ascending pluck when you thread a gate; pitch climbs with streak
+  chime(streak) {
+    if (!this.started || this.muted) return;
+    const t = this.ac.currentTime;
+    const m = 81 + [0, 3, 7, 12][Math.min(3, (streak - 1) % 4)] + 12 * Math.min(1, ((streak - 1) / 4) | 0);
+    this.osc("triangle", this.f(m), t, 0.5, 0.25, this.duck);
+    this.osc("sine", this.f(m) * 2, t, 0.3, 0.1, this.delay);
+  },
+
+  // soft falling tone when a shard clips you - zen, not a buzzer
+  thud() {
+    if (!this.started || this.muted) return;
+    const t = this.ac.currentTime;
+    const o = this.ac.createOscillator(), g = this.ac.createGain();
+    o.type = "sine";
+    o.frequency.setValueAtTime(220, t);
+    o.frequency.exponentialRampToValueAtTime(60, t + 0.5);
+    this.env(g.gain, t, 0.01, 0.4, 0.5);
+    o.connect(g); g.connect(this.master);
+    o.start(t); o.stop(t + 0.7);
+  },
+
+  setMuted(m) {
+    this.muted = m;
+    store.set("rs_muted", m ? "1" : "0");
+    if (this.master) this.master.gain.value = m ? 0 : 0.6;
+  },
+};
+
+/* ============================================================== *
+ *  GAME STATE
+ * ============================================================== */
+const player = {
+  x: 0,            // world x (camera sits at fixed screen x)
+  y: 0,
+  vy: 0,
+  ay: 0,           // smoothed vertical acceleration -> C2-ish path
+  screenX: 0.28,   // fraction of width where the ship sits
+};
+
+const state = {
+  running: false,          // title screen until first input
+  holding: false,
+  dist: 0,                 // metres (world px / 10)
+  best: parseFloat(store.get("rs_best") || "0"),
+  score: 0,
+  streak: 0,
+  bestStreak: 0,
+  mult: 1,                 // blueshift multiplier, from curvature heat
+  curveHeat: 0,
+  comb: store.get("rs_comb") !== "0",
+  speed: 230,
+  hitFlash: 0,             // combo-break feedback timer
+  gateFlash: 0,
+  iframes: 0,
+  beatEnv: 0,
+  time: 0,
+};
+
+const trail = [];          // sampled path points {x (world), y, k (curvature)}
+const gates = [];          // {x, y, r, hit, missed}
+const shards = [];         // {x, y, vy, rot, vr, r}
+let stars = [];
+let nextGateX = 0;
+let nextShardX = 0;
+
+function buildStars() {
+  stars = [];
+  const n = Math.round((W * H) / 11000);
+  for (let i = 0; i < n; i++) {
+    stars.push({
+      x: Math.random() * W, y: Math.random() * H,
+      z: rand(0.12, 0.45),                 // parallax factor
+      a: rand(0.08, 0.5),
+      tw: rand(0.5, 2.5),                  // twinkle rate
+      red: Math.random() < 0.18,
+    });
+  }
+}
+
+function resetRun() {
+  state.dist = 0; state.score = 0; state.streak = 0;
+  state.speed = 230; state.curveHeat = 0; state.mult = 1;
+  trail.length = 0; gates.length = 0; shards.length = 0;
+  player.x = 0; player.y = H * 0.5; player.vy = 0; player.ay = 0;
+  nextGateX = 700;
+  nextShardX = 1600;
+}
+
+/* ---------- procedural generation ---------- */
+let lastGateY = null;
+function genAhead() {
+  const horizon = player.x + W * 1.4;
+  while (nextGateX < horizon) {
+    if (lastGateY === null) lastGateY = H * 0.5;
+    const y = clamp(lastGateY + rand(-H * 0.3, H * 0.3), H * 0.16, H * 0.84);
+    gates.push({ x: nextGateX, y, r: clamp(H * 0.085, 42, 70), hit: false, missed: false });
+    lastGateY = y;
+    nextGateX += rand(430, 700) + state.speed * 0.35;
+  }
+  while (nextShardX < horizon) {
+    shards.push({
+      x: nextShardX, y: rand(H * 0.12, H * 0.88),
+      vy: rand(-18, 18), rot: rand(0, TAU), vr: rand(-1.2, 1.2), r: 14,
+    });
+    nextShardX += rand(900, 2200);
+  }
+  // cull what's behind us
+  const behind = player.x - W * 0.5;
+  while (gates.length && gates[0].x < behind) gates.shift();
+  while (shards.length && shards[0].x < behind) shards.shift();
+}
+
+/* ---------- physics ---------- */
+function step(dt) {
+  state.time += dt;
+
+  // speed ramps gently, then settles
+  state.speed = Math.min(430, state.speed + 3.5 * dt);
+
+  // input shapes acceleration, not velocity: this is what makes the
+  // path a smooth curve instead of a sawtooth
+  const target = state.holding ? -900 : 900;
+  player.ay = damp(player.ay, target, 5, dt);
+  player.vy = clamp(player.vy + player.ay * dt, -560, 560);
+
+  // soft walls: spring back near the edges so the curve stays smooth
+  const m = 46;
+  if (player.y < m)      player.vy += (m - player.y) * 26 * dt;
+  if (player.y > H - m)  player.vy -= (player.y - (H - m)) * 26 * dt;
+
+  player.x += state.speed * dt;
+  player.y = clamp(player.y + player.vy * dt, 8, H - 8);
+
+  // sample the trail every few px of travel
+  const last = trail[trail.length - 1];
+  if (!last || player.x - last.x > 7) {
+    trail.push({ x: player.x, y: player.y, k: 0 });
+    if (trail.length > 260) trail.shift();
+    computeCurvature();
+  }
+
+  // curvature heat -> blueshift multiplier (tight flying pays)
+  const kNow = Math.abs(currentK());
+  state.curveHeat = damp(state.curveHeat, clamp(kNow * 260, 0, 3), 1.6, dt);
+  state.mult = 1 + state.curveHeat;
+
+  state.dist += state.speed * dt / 10;
+  state.score += state.speed * dt * 0.012 * state.mult;
+
+  // gates
+  for (const g of gates) {
+    if (!g.hit && !g.missed && g.x <= player.x) {
+      if (Math.abs(player.y - g.y) <= g.r) {
+        g.hit = true;
+        state.streak++;
+        state.bestStreak = Math.max(state.bestStreak, state.streak);
+        state.score += 120 * state.mult;
+        state.gateFlash = 1;
+        Audio.chime(state.streak);
+      } else {
+        g.missed = true;
+        state.streak = 0;
+      }
+    }
+  }
+
+  // shards: contact breaks the combo. Nothing dies in this game.
+  if (state.iframes > 0) state.iframes -= dt;
+  for (const sh of shards) {
+    sh.y += sh.vy * dt;
+    sh.rot += sh.vr * dt;
+    if (state.iframes <= 0) {
+      const dx = sh.x - player.x, dy = sh.y - player.y;
+      if (dx * dx + dy * dy < 24 * 24) {
+        state.streak = 0;
+        state.curveHeat = 0;
+        state.hitFlash = 1;
+        state.iframes = 1.2;
+        Audio.thud();
+      }
+    }
+  }
+
+  if (state.hitFlash > 0)  state.hitFlash  = Math.max(0, state.hitFlash - dt * 2.2);
+  if (state.gateFlash > 0) state.gateFlash = Math.max(0, state.gateFlash - dt * 3);
+
+  // audio -> visual beat
+  if (Audio.started) {
+    const now = Audio.ac.currentTime;
+    while (Audio.beatQueue.length && Audio.beatQueue[0] <= now) {
+      Audio.beatQueue.shift();
+      state.beatEnv = 1;
+    }
+  }
+  state.beatEnv = Math.max(0, state.beatEnv - dt * 3.2);
+
+  if (state.dist > state.best) {
+    state.best = state.dist;
+    if ((state.dist | 0) % 10 === 0) store.set("rs_best", String(state.best));
+  }
+
+  genAhead();
+}
+
+/* ---------- curvature ---------- *
+ * Signed curvature from the sampled polyline: kappa = d(theta)/ds.
+ * This is the quantity the comb visualises and the blueshift pays. */
+function computeCurvature() {
+  const n = trail.length;
+  if (n < 3) return;
+  const i = n - 2;
+  const a = trail[i - 1], b = trail[i], c = trail[i + 1];
+  const th1 = Math.atan2(b.y - a.y, b.x - a.x);
+  const th2 = Math.atan2(c.y - b.y, c.x - b.x);
+  const ds = (Math.hypot(b.x - a.x, b.y - a.y) + Math.hypot(c.x - b.x, c.y - b.y)) / 2;
+  b.k = ds > 0.0001 ? wrapAngle(th2 - th1) / ds : 0;
+}
+
+function currentK() {
+  const n = trail.length;
+  return n >= 2 ? trail[n - 2].k : 0;
+}
+
+/* ============================================================== *
+ *  RENDER
+ * ============================================================== */
+function worldToScreenX(wx) { return wx - player.x + W * player.screenX; }
+
+function drawBackground() {
+  cx.fillStyle = COL.bg;
+  cx.fillRect(0, 0, W, H);
+
+  // faint red nebula: three drifting radial glows
+  cx.globalCompositeOperation = "lighter";
+  const drift = state.time * 0.02;
+  for (let i = 0; i < 3; i++) {
+    const nx = W * (0.2 + 0.3 * i) + Math.sin(drift + i * 2.1) * W * 0.06;
+    const ny = H * (0.3 + 0.2 * Math.sin(i * 1.7 + drift * 0.7));
+    const r = Math.max(W, H) * 0.45;
+    const g = cx.createRadialGradient(nx, ny, 0, nx, ny, r);
+    g.addColorStop(0, "rgba(130,15,15,0.07)");
+    g.addColorStop(1, "rgba(0,0,0,0)");
+    cx.fillStyle = g;
+    cx.fillRect(nx - r, ny - r, r * 2, r * 2);
+  }
+
+  // starfield with parallax
+  for (const s of stars) {
+    const sx = ((s.x - player.x * s.z) % W + W) % W;
+    const tw = 0.7 + 0.3 * Math.sin(state.time * s.tw + s.x);
+    cx.globalAlpha = s.a * tw;
+    cx.fillStyle = s.red ? "#ff6a58" : "#fff3ee";
+    cx.fillRect(sx, s.y, s.z > 0.3 ? 2 : 1, s.z > 0.3 ? 2 : 1);
+  }
+  cx.globalAlpha = 1;
+  cx.globalCompositeOperation = "source-over";
+}
+
+function drawTrail() {
+  const n = trail.length;
+  if (n < 2) return;
+  cx.globalCompositeOperation = "lighter";
+  cx.lineCap = "round";
+  cx.lineJoin = "round";
+
+  // three passes: wide soft bloom, mid glow, hot core.
+  const passes = [
+    { w: 13, a: 0.07, c: "255,45,30" },
+    { w: 5,  a: 0.22, c: "255,45,30" },
+    { w: 1.8, a: 0.9, c: "255,138,114" },
+  ];
+  for (const p of passes) {
+    cx.beginPath();
+    for (let i = 0; i < n; i++) {
+      const sx = worldToScreenX(trail[i].x);
+      if (i === 0) cx.moveTo(sx, trail[i].y);
+      else cx.lineTo(sx, trail[i].y);
+    }
+    cx.lineWidth = p.w;
+    cx.strokeStyle = "rgba(" + p.c + "," + p.a + ")";
+    cx.stroke();
+  }
+
+  // fade the oldest part of the tail by painting bg back over it
+  cx.globalCompositeOperation = "destination-out";
+  const fadeEnd = worldToScreenX(trail[0].x) + W * 0.12;
+  const fg = cx.createLinearGradient(0, 0, Math.max(fadeEnd, 1), 0);
+  fg.addColorStop(0, "rgba(0,0,0,1)");
+  fg.addColorStop(1, "rgba(0,0,0,0)");
+  cx.fillStyle = fg;
+  cx.fillRect(0, 0, fadeEnd, H);
+  cx.globalCompositeOperation = "source-over";
+}
+
+/* The comb: Freya Holmer's signature lens. A normal line at each
+ * sample, length proportional to |kappa|, on the outside of the
+ * bend, plus a faint curve through the comb tips and the
+ * osculating circle at the ship. All of it in the cool blue that
+ * nothing else in the game is allowed to use. */
+function drawComb() {
+  const n = trail.length;
+  if (n < 4) return;
+  cx.globalCompositeOperation = "lighter";
+  const tips = [];
+  for (let i = 2; i < n - 1; i += 2) {
+    const a = trail[i - 1], b = trail[i + 1], p = trail[i];
+    let dx = b.x - a.x, dy = b.y - a.y;
+    const len = Math.hypot(dx, dy) || 1;
+    dx /= len; dy /= len;
+    const L = clamp(Math.abs(p.k) * 9000, 0, 64) * -Math.sign(p.k || 1);
+    const sx = worldToScreenX(p.x);
+    const tx = sx - dy * L, ty = p.y + dx * L;
+    tips.push([tx, ty]);
+    cx.beginPath();
+    cx.moveTo(sx, p.y);
+    cx.lineTo(tx, ty);
+    cx.lineWidth = 1;
+    cx.strokeStyle = "rgba(90,209,255,0.33)";
+    cx.stroke();
+  }
+  if (tips.length > 1) {
+    cx.beginPath();
+    for (let i = 0; i < tips.length; i++) {
+      if (i === 0) cx.moveTo(tips[i][0], tips[i][1]);
+      else cx.lineTo(tips[i][0], tips[i][1]);
+    }
+    cx.lineWidth = 1;
+    cx.strokeStyle = "rgba(90,209,255,0.22)";
+    cx.stroke();
+  }
+
+  // osculating circle at the ship
+  const k = currentK();
+  if (Math.abs(k) > 0.0012) {
+    const R = Math.min(1 / Math.abs(k), H * 1.2);
+    const i = n - 2;
+    const a = trail[i - 1], b = trail[i + 1];
+    let dx = b.x - a.x, dy = b.y - a.y;
+    const len = Math.hypot(dx, dy) || 1;
+    dx /= len; dy /= len;
+    const sx = worldToScreenX(trail[i].x);
+    const cxx = sx - dy * R * Math.sign(k);
+    const cyy = trail[i].y + dx * R * Math.sign(k);
+    cx.beginPath();
+    cx.arc(cxx, cyy, R, 0, TAU);
+    cx.lineWidth = 1;
+    cx.strokeStyle = "rgba(90,209,255,0.28)";
+    cx.stroke();
+    cx.beginPath();
+    cx.arc(cxx, cyy, 2, 0, TAU);
+    cx.fillStyle = "rgba(90,209,255,0.5)";
+    cx.fill();
+  }
+  cx.globalCompositeOperation = "source-over";
+}
+
+function drawGates() {
+  cx.globalCompositeOperation = "lighter";
+  const pulse = reducedMotion ? 0 : state.beatEnv * 0.05;
+  for (const g of gates) {
+    const sx = worldToScreenX(g.x);
+    if (sx < -100 || sx > W + 100) continue;
+    const r = g.r * (1 + pulse);
+    const a = g.hit ? 0.14 : g.missed ? 0.07 : 0.5;
+    // ring drawn as an ellipse to read as a 3D hoop seen side-on
+    for (const p of [[7, 0.18], [2.5, 1]]) {
+      cx.beginPath();
+      cx.ellipse(sx, g.y, r * 0.32, r, 0, 0, TAU);
+      cx.lineWidth = p[0];
+      cx.strokeStyle = g.hit
+        ? "rgba(255,243,238," + a * p[1] + ")"
+        : "rgba(255,45,30," + a * p[1] + ")";
+      cx.stroke();
+    }
+  }
+  cx.globalCompositeOperation = "source-over";
+}
+
+function drawShards() {
+  cx.globalCompositeOperation = "lighter";
+  for (const sh of shards) {
+    const sx = worldToScreenX(sh.x);
+    if (sx < -60 || sx > W + 60) continue;
+    cx.save();
+    cx.translate(sx, sh.y);
+    cx.rotate(sh.rot);
+    cx.beginPath();
+    cx.moveTo(sh.r, 0);
+    cx.lineTo(-sh.r * 0.7, sh.r * 0.75);
+    cx.lineTo(-sh.r * 0.4, 0);
+    cx.lineTo(-sh.r * 0.7, -sh.r * 0.75);
+    cx.closePath();
+    cx.strokeStyle = "rgba(255,45,30,0.75)";
+    cx.lineWidth = 1.6;
+    cx.stroke();
+    cx.fillStyle = "rgba(138,21,16,0.3)";
+    cx.fill();
+    cx.restore();
+  }
+  cx.globalCompositeOperation = "source-over";
+}
+
+function drawShip() {
+  const sx = W * player.screenX;
+  const blink = state.iframes > 0 && (state.time * 12 | 0) % 2 === 0;
+  if (blink) return;
+  cx.globalCompositeOperation = "lighter";
+  const g = cx.createRadialGradient(sx, player.y, 0, sx, player.y, 26);
+  g.addColorStop(0, "rgba(255,243,238,0.9)");
+  g.addColorStop(0.25, "rgba(255,80,60,0.55)");
+  g.addColorStop(1, "rgba(255,45,30,0)");
+  cx.fillStyle = g;
+  cx.fillRect(sx - 26, player.y - 26, 52, 52);
+  cx.beginPath();
+  cx.arc(sx, player.y, 3.2, 0, TAU);
+  cx.fillStyle = COL.white;
+  cx.fill();
+  cx.globalCompositeOperation = "source-over";
+}
+
+/* ---------- HUD: the night clock ---------- */
+function pad4(n) { return String(Math.min(9999, n | 0)).padStart(4, "0"); }
+
+function drawDigits(text, cxPos, cyPos, size, color, glow) {
+  cx.font = "100 " + size + "px -apple-system, 'Helvetica Neue', 'Segoe UI', sans-serif";
+  cx.textBaseline = "middle";
+  const dw = cx.measureText("0").width;
+  const total = dw * text.length;
+  cx.shadowColor = glow;
+  cx.shadowBlur = size * 0.4;
+  cx.fillStyle = color;
+  // fixed-width slots so the counter doesn't jitter
+  for (let i = 0; i < text.length; i++) {
+    const ch = text[i];
+    const w = cx.measureText(ch).width;
+    cx.fillText(ch, cxPos - total / 2 + dw * i + (dw - w) / 2, cyPos);
+  }
+  cx.shadowBlur = 0;
+}
+
+function label(text, x, y, align, color, size, spacing) {
+  cx.font = "300 " + (size || 11) + "px -apple-system, 'Helvetica Neue', 'Segoe UI', sans-serif";
+  cx.textBaseline = "middle";
+  cx.textAlign = "left";
+  const sp = spacing === undefined ? 3 : spacing;
+  let total = 0;
+  for (const ch of text) total += cx.measureText(ch).width + sp;
+  let px = align === "center" ? x - total / 2 : align === "right" ? x - total : x;
+  cx.fillStyle = color;
+  for (const ch of text) {
+    cx.fillText(ch, px, y);
+    px += cx.measureText(ch).width + sp;
+  }
+}
+
+function drawHUD() {
+  const topY = Math.max(54, H * 0.09);
+
+  // the StandBy clock: distance as the glowing bedside numerals
+  const gateBoost = state.gateFlash * 0.25;
+  drawDigits(pad4(state.dist), W / 2, topY,
+    clamp(W * 0.13, 44, 92),
+    "rgba(255,62,40," + (0.82 + gateBoost) + ")",
+    "rgba(255,30,20,0.9)");
+  label("LIGHT-SECONDS", W / 2, topY + clamp(W * 0.08, 30, 56), "center",
+    "rgba(255,90,70,0.4)", 10, 4);
+
+  if (state.best >= 1) {
+    label("BEST " + pad4(state.best), W / 2, topY + clamp(W * 0.08, 30, 56) + 20,
+      "center", "rgba(255,90,70,0.28)", 10, 3);
+  }
+
+  // streak + blueshift, left
+  const lx = 18, ly = 26;
+  label("GATES " + state.streak, lx, ly, "left", "rgba(255,110,90,0.6)", 12, 2);
+  if (state.mult > 1.12) {
+    const b = clamp((state.mult - 1) / 3, 0, 1);
+    cx.shadowColor = "rgba(90,209,255,0.8)";
+    cx.shadowBlur = 10 * b;
+    label("BLUESHIFT x" + state.mult.toFixed(1), lx, ly + 22, "left",
+      "rgba(90,209,255," + (0.35 + 0.6 * b) + ")", 12, 2);
+    cx.shadowBlur = 0;
+  }
+  label("SCORE " + String(state.score | 0), lx, ly + 44, "left", "rgba(255,110,90,0.35)", 11, 2);
+
+  // the homage: a real dim clock, top right, like the phone on its side
+  const t = new Date();
+  const hh = String(t.getHours()).padStart(2, "0");
+  const mm = String(t.getMinutes()).padStart(2, "0");
+  label(hh + ":" + mm, W - 18, 26, "right", "rgba(255,70,50,0.35)", 14, 2);
+
+  // combo-break vignette
+  if (state.hitFlash > 0 && !reducedMotion) {
+    const g = cx.createRadialGradient(W / 2, H / 2, H * 0.3, W / 2, H / 2, H * 0.75);
+    g.addColorStop(0, "rgba(0,0,0,0)");
+    g.addColorStop(1, "rgba(255,30,20," + 0.22 * state.hitFlash + ")");
+    cx.fillStyle = g;
+    cx.fillRect(0, 0, W, H);
+  }
+}
+
+function drawTitle() {
+  drawBackground();
+  cx.textAlign = "left";
+  const cy = H * 0.42;
+  cx.globalCompositeOperation = "lighter";
+  cx.font = "100 " + clamp(W * 0.11, 40, 110) + "px -apple-system, 'Helvetica Neue', 'Segoe UI', sans-serif";
+  cx.textBaseline = "middle";
+  const t = "REDSHIFT";
+  const sp = clamp(W * 0.012, 4, 14);
+  let total = 0;
+  for (const ch of t) total += cx.measureText(ch).width + sp;
+  let px = W / 2 - total / 2;
+  cx.shadowColor = "rgba(255,30,20,0.9)";
+  cx.shadowBlur = 34;
+  cx.fillStyle = "rgba(255,62,40,0.92)";
+  for (const ch of t) { cx.fillText(ch, px, cy); px += cx.measureText(ch).width + sp; }
+  cx.shadowBlur = 0;
+  cx.globalCompositeOperation = "source-over";
+
+  const breathe = 0.5 + (reducedMotion ? 0 : 0.25 * Math.sin(state.time * 1.8));
+  label("HOLD TO RISE · RELEASE TO FALL", W / 2, cy + clamp(W * 0.1, 50, 90), "center",
+    "rgba(255,120,100," + breathe + ")", 12, 4);
+  label("THREAD THE GATES · FLY TIGHT CURVES TO BLUESHIFT", W / 2, cy + clamp(W * 0.1, 50, 90) + 24,
+    "center", "rgba(255,120,100,0.3)", 10, 3);
+  label("C CURVATURE · M AUDIO", W / 2, cy + clamp(W * 0.1, 50, 90) + 46,
+    "center", "rgba(255,120,100,0.22)", 10, 3);
+
+  const tnow = new Date();
+  label(String(tnow.getHours()).padStart(2, "0") + ":" + String(tnow.getMinutes()).padStart(2, "0"),
+    W - 18, 26, "right", "rgba(255,70,50,0.35)", 14, 2);
+}
+
+/* ============================================================== *
+ *  LOOP
+ * ============================================================== */
+let lastT = 0;
+function frame(ts) {
+  requestAnimationFrame(frame);
+  const dt = Math.min((ts - lastT) / 1000 || 0.016, 0.05);
+  lastT = ts;
+  if (!state.running) {
+    state.time += dt;
+    drawTitle();
+    return;
+  }
+  if (paused) return;
+  step(dt);
+
+  // screen shake on combo break
+  let shx = 0, shy = 0;
+  if (state.hitFlash > 0.4 && !reducedMotion) {
+    shx = rand(-3, 3) * state.hitFlash;
+    shy = rand(-3, 3) * state.hitFlash;
+  }
+  cx.save();
+  cx.translate(shx, shy);
+  drawBackground();
+  drawGates();
+  drawShards();
+  drawTrail();
+  if (state.comb) drawComb();
+  drawShip();
+  cx.restore();
+  drawHUD();
+}
+
+/* ---------- input ---------- */
+function press() {
+  if (!state.running) {
+    state.running = true;
+    resetRun();
+  }
+  Audio.start();
+  state.holding = true;
+}
+function release() { state.holding = false; }
+
+cv.addEventListener("pointerdown", e => { e.preventDefault(); press(); });
+addEventListener("pointerup", release);
+addEventListener("pointercancel", release);
+cv.addEventListener("contextmenu", e => e.preventDefault());
+
+const holdKeys = new Set();
+addEventListener("keydown", e => {
+  if (e.repeat) return;
+  const k = e.key.toLowerCase();
+  if (k === " " || k === "arrowup" || k === "w") {
+    e.preventDefault();
+    holdKeys.add(k);
+    press();
+  } else if (k === "c") toggleComb();
+  else if (k === "m") toggleMute();
+  else if (k === "p") togglePause();
+});
+addEventListener("keyup", e => {
+  const k = e.key.toLowerCase();
+  holdKeys.delete(k);
+  if (holdKeys.size === 0 && (k === " " || k === "arrowup" || k === "w")) release();
+});
+
+/* ---------- buttons / toggles ---------- */
+const combBtn = document.getElementById("combBtn");
+const muteBtn = document.getElementById("muteBtn");
+
+function syncButtons() {
+  combBtn.classList.toggle("on", state.comb);
+  muteBtn.classList.toggle("on-red", !Audio.muted);
+  muteBtn.innerHTML = Audio.muted ? "&#9834;" : "&#9835;";
+}
+function toggleComb() {
+  state.comb = !state.comb;
+  store.set("rs_comb", state.comb ? "1" : "0");
+  syncButtons();
+}
+function toggleMute() {
+  Audio.setMuted(!Audio.muted);
+  syncButtons();
+}
+for (const [btn, fn] of [[combBtn, toggleComb], [muteBtn, toggleMute]]) {
+  btn.addEventListener("pointerdown", e => e.stopPropagation());
+  btn.addEventListener("click", e => { e.stopPropagation(); fn(); });
+}
+
+/* ---------- pause on hidden tab ---------- */
+let paused = false;
+function togglePause() { setPaused(!paused); }
+function setPaused(p) {
+  paused = p;
+  if (Audio.ac) {
+    if (p) Audio.ac.suspend();
+    else Audio.ac.resume();
+  }
+}
+document.addEventListener("visibilitychange", () => {
+  if (document.hidden) setPaused(true);
+  else { setPaused(false); lastT = performance.now(); }
+});
+
+/* ---------- go ---------- */
+addEventListener("resize", resize);
+resize();
+player.y = H * 0.5;
+syncButtons();
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>
